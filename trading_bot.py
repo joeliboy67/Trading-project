@@ -2,16 +2,22 @@
 Automated Trading Bot — Bullish & Bearish Reversal Detection
 
 Strategy:
-  1. Identify support/resistance from recent swing lows/highs.
-  2. When price bounces off previous support and breaks previous resistance
-     → place a BUY with SL at support and TP at resistance above.
-  3. Invalidate the setup if price breaks below support with bearish
-     continuation (consecutive bearish closes below support).
-  4. Additional confirmation from RSI divergence, MACD histogram reversal,
-     candlestick patterns, and EMA trend context.
+  BULLISH setup:
+    1. Price bounces off previous support and breaks previous resistance.
+    2. BUY — SL at support, TP at next resistance above.
+    3. Invalidated if price breaks below support with bearish continuation.
 
-A trade signal fires when the support/resistance condition is met and at
-least one confirming indicator agrees.
+  BEARISH setup (neckline break):
+    1. Price is rejected at previous resistance (or makes a lower high).
+    2. Price breaks below the neckline (previous support).
+    3. SELL — SL at resistance, TP at the support below the neckline.
+    4. Invalidated if price breaks above resistance (bullish continuation).
+
+  Additional confirmation from RSI divergence, MACD histogram reversal,
+  candlestick patterns, and EMA trend context.
+
+A trade signal fires when the S/R condition is met and at least one
+confirming indicator agrees.
 """
 
 import os
@@ -33,9 +39,13 @@ EXCHANGE_ID = os.getenv("EXCHANGE", "binance")
 API_KEY = os.getenv("API_KEY", "")
 API_SECRET = os.getenv("API_SECRET", "")
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
-TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "0.001"))
+TIMEFRAMES = os.getenv("TIMEFRAMES", "15m,5m").split(",")  # scan multiple timeframes
+TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "0.001"))  # fallback if no SL for sizing
 LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+
+# Risk management
+MAX_RISK_PER_TRADE = 0.03   # 3 % of capital risked per trade (max drawdown per trade)
+MAX_CAPITAL_EXPOSURE = 0.05  # 5 % of capital exposed to the market at any time
 
 # Indicator settings
 RSI_PERIOD = 14
@@ -52,6 +62,8 @@ LOOKBACK_CANDLES = 250
 SWING_WINDOW = 10          # bars each side to qualify as swing high/low
 SR_TOUCH_TOLERANCE = 0.002 # 0.2 % proximity counts as a "touch"
 BEARISH_CONT_BARS = 2      # consecutive bearish closes below support = invalid
+BULLISH_CONT_BARS = 2      # consecutive bullish closes above resistance = invalid (bearish setup)
+LOWER_HIGH_TOLERANCE = 0.005  # 0.5 % — new high this much below prev resistance = "lower high"
 
 # Signals
 MIN_SIGNALS = 2  # S/R setup counts as 1; need at least 1 more confirming signal
@@ -82,8 +94,8 @@ def create_exchange() -> ccxt.Exchange:
     return exchange
 
 
-def fetch_ohlcv(exchange: ccxt.Exchange) -> pd.DataFrame:
-    raw = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=LOOKBACK_CANDLES)
+def fetch_ohlcv(exchange: ccxt.Exchange, timeframe: str) -> pd.DataFrame:
+    raw = exchange.fetch_ohlcv(SYMBOL, timeframe, limit=LOOKBACK_CANDLES)
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
@@ -228,6 +240,89 @@ def detect_sr_setup(df: pd.DataFrame) -> dict | None:
     }
 
 
+def detect_bearish_sr_setup(df: pd.DataFrame) -> dict | None:
+    """
+    Bearish neckline-break setup:
+      1. Price was rejected at the previous resistance OR made a lower high
+         (recent high is slightly below the previous swing-high resistance).
+      2. Price has now broken below the neckline (the previous support).
+      3. SELL with SL at the resistance and TP at the support below the
+         neckline.
+      4. Invalidated if price breaks above resistance (bullish continuation):
+         BULLISH_CONT_BARS consecutive bullish closes above resistance.
+    """
+    supports, resistances = find_swing_levels(df)
+    if not supports or not resistances:
+        return None
+
+    curr_close = df["close"].iloc[-1]
+
+    # --- Find the previous resistance (nearest above current price) ---
+    resistance = nearest_level_above(curr_close, resistances)
+    if resistance is None:
+        # Price is above all known resistances — no rejection happened
+        return None
+
+    # --- Check rejection / lower high ---
+    # Look at recent candles: did price approach resistance and get rejected,
+    # or make a high that is slightly lower than resistance?
+    lookback = df.iloc[-20:]
+    tolerance = resistance * SR_TOUCH_TOLERANCE
+    lower_high_threshold = resistance * (1 - LOWER_HIGH_TOLERANCE)
+
+    recent_high = lookback["high"].max()
+    rejected_at_resistance = recent_high >= resistance - tolerance and curr_close < resistance
+    made_lower_high = lower_high_threshold <= recent_high < resistance
+
+    if not (rejected_at_resistance or made_lower_high):
+        log.info(f"  No rejection / lower-high near resistance {resistance:.2f}")
+        return None
+
+    # --- Find the neckline (previous support that price has broken below) ---
+    # The neckline is a support level that is above the current price,
+    # meaning price has broken down through it.
+    neckline_candidates = sorted(
+        [s for s in supports if curr_close < s < resistance]
+    )
+    if not neckline_candidates:
+        log.info("  Price has not broken below any neckline (support)")
+        return None
+
+    neckline = neckline_candidates[0]  # lowest broken support (closest to price)
+
+    # --- Invalidation: bullish continuation above resistance ---
+    recent = df.iloc[-BULLISH_CONT_BARS:]
+    bullish_above_resistance = all(
+        recent["close"].iloc[i] > resistance and recent["close"].iloc[i] > recent["open"].iloc[i]
+        for i in range(len(recent))
+    )
+    if bullish_above_resistance:
+        log.info(
+            f"  INVALIDATED — {BULLISH_CONT_BARS} consecutive bullish closes "
+            f"above resistance {resistance:.2f}"
+        )
+        return None
+
+    # --- Take-profit: the support level below the neckline ---
+    tp_support = nearest_level_below(neckline, supports)
+    if tp_support is None:
+        # Fallback: measured move (neckline − (resistance − neckline))
+        move = resistance - neckline
+        tp_support = neckline - move
+
+    log.info(f"  Neckline (broken support): {neckline:.2f}")
+    log.info(f"  Resistance (rejection):    {resistance:.2f}")
+    log.info(f"  Stop-loss:  {resistance:.2f}  |  Take-profit: {tp_support:.2f}")
+
+    return {
+        "direction": "bearish",
+        "neckline": neckline,
+        "resistance": resistance,
+        "stop_loss": resistance,
+        "take_profit": tp_support,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Confirming reversal signals
 # ---------------------------------------------------------------------------
@@ -350,10 +445,11 @@ def aggregate_signals(df: pd.DataFrame) -> tuple[str, int, dict | None]:
     """
     Returns (direction, total_strength, sr_setup_or_None).
 
-    The S/R bounce-and-break setup is the primary trigger. Confirming
-    indicators add strength. A trade fires when total strength >= MIN_SIGNALS.
+    The S/R setups are the primary triggers. Confirming indicators add
+    strength. A trade fires when total strength >= MIN_SIGNALS.
     """
-    sr_setup = detect_sr_setup(df)
+    bullish_setup = detect_sr_setup(df)
+    bearish_setup = detect_bearish_sr_setup(df)
 
     confirming_detectors = [
         detect_candlestick_patterns,
@@ -366,10 +462,13 @@ def aggregate_signals(df: pd.DataFrame) -> tuple[str, int, dict | None]:
     bullish_total = 0
     bearish_total = 0
 
-    # S/R setup counts as 1 bullish signal
-    if sr_setup and sr_setup["direction"] == "bullish":
+    if bullish_setup:
         bullish_total += 1
         log.info("  S/R bounce-and-break setup ACTIVE (bullish +1)")
+
+    if bearish_setup:
+        bearish_total += 1
+        log.info("  S/R neckline-break setup ACTIVE (bearish +1)")
 
     for detector in confirming_detectors:
         result = detector(df)
@@ -378,15 +477,68 @@ def aggregate_signals(df: pd.DataFrame) -> tuple[str, int, dict | None]:
 
     log.info(f"Signal tally — bullish: {bullish_total}, bearish: {bearish_total}")
 
-    # Only go long if the S/R setup is present and we have enough confirmation
-    if sr_setup and bullish_total >= MIN_SIGNALS and bullish_total > bearish_total:
-        return "bullish", bullish_total, sr_setup
+    # Bullish: S/R setup required + enough confirmation
+    if bullish_setup and bullish_total >= MIN_SIGNALS and bullish_total > bearish_total:
+        return "bullish", bullish_total, bullish_setup
 
-    # Allow standalone bearish signals (no S/R setup needed for shorts)
-    if bearish_total >= MIN_SIGNALS and bearish_total > bullish_total:
-        return "bearish", bearish_total, None
+    # Bearish: S/R neckline-break setup required + enough confirmation
+    if bearish_setup and bearish_total >= MIN_SIGNALS and bearish_total > bullish_total:
+        return "bearish", bearish_total, bearish_setup
 
     return "neutral", 0, None
+
+
+# ---------------------------------------------------------------------------
+# Risk management & position sizing
+# ---------------------------------------------------------------------------
+def get_account_balance(exchange: ccxt.Exchange) -> float:
+    """Fetch total USDT (or quote-currency) balance."""
+    balance = exchange.fetch_balance()
+    quote = SYMBOL.split("/")[1]  # e.g. "USDT"
+    total = balance.get("total", {}).get(quote, 0.0)
+    return float(total)
+
+
+def get_open_exposure(exchange: ccxt.Exchange) -> float:
+    """Sum the notional value of all open positions / orders."""
+    try:
+        positions = exchange.fetch_positions([SYMBOL])
+        exposure = sum(
+            abs(float(p.get("notional", 0) or 0))
+            for p in positions
+            if float(p.get("contracts", 0) or 0) != 0
+        )
+        return exposure
+    except (ccxt.ExchangeError, ccxt.NotSupported):
+        return 0.0
+
+
+def calculate_position_size(
+    entry_price: float,
+    sl_price: float,
+    capital: float,
+) -> float:
+    """
+    Size the position so the maximum loss (entry → SL) equals
+    MAX_RISK_PER_TRADE % of capital.
+
+        position_size = (capital × max_risk) / |entry − SL|
+
+    Then clamp so total exposure stays within MAX_CAPITAL_EXPOSURE.
+    """
+    risk_distance = abs(entry_price - sl_price)
+    if risk_distance == 0:
+        return TRADE_AMOUNT  # fallback
+
+    risk_amount = capital * MAX_RISK_PER_TRADE          # e.g. 3 % of $10 000 = $300
+    position_value = risk_amount / (risk_distance / entry_price)  # notional $
+    qty = position_value / entry_price
+
+    log.info(
+        f"  Position sizing: capital=${capital:.2f}  risk$={risk_amount:.2f}  "
+        f"distance={risk_distance:.2f}  qty={qty:.6f}"
+    )
+    return qty
 
 
 # ---------------------------------------------------------------------------
@@ -399,33 +551,84 @@ def execute_trade(
     sr_setup: dict | None,
 ):
     """
-    Place a market order with optional stop-loss and take-profit.
+    Place a market order with stop-loss and take-profit.
 
-    When the S/R setup is present the SL/TP are derived from the detected
-    support and resistance levels.
+    Position size is calculated from the SL distance so that maximum
+    drawdown per trade is MAX_RISK_PER_TRADE (3 %).  Total market
+    exposure is capped at MAX_CAPITAL_EXPOSURE (5 %) of capital.
     """
     side = "buy" if direction == "bullish" else "sell"
 
     sl_price = sr_setup["stop_loss"] if sr_setup else None
     tp_price = sr_setup["take_profit"] if sr_setup else None
 
+    # --- Determine position size ---
+    if LIVE_TRADING:
+        capital = get_account_balance(exchange)
+    else:
+        capital = 10_000.0  # simulated capital for paper trading
+
+    try:
+        ticker = exchange.fetch_ticker(SYMBOL)
+        entry_price = float(ticker["last"])
+    except (ccxt.ExchangeError, ccxt.NetworkError):
+        entry_price = float(
+            pd.DataFrame(
+                exchange.fetch_ohlcv(SYMBOL, TIMEFRAMES[0].strip(), limit=1),
+                columns=["ts", "o", "h", "l", "c", "v"],
+            )["c"].iloc[0]
+        )
+
+    if sl_price:
+        qty = calculate_position_size(entry_price, sl_price, capital)
+    else:
+        qty = TRADE_AMOUNT
+
+    # --- Exposure cap: ensure total exposure stays ≤ 5 % of capital ---
+    max_notional = capital * MAX_CAPITAL_EXPOSURE
+    order_notional = qty * entry_price
+
+    if LIVE_TRADING:
+        current_exposure = get_open_exposure(exchange)
+    else:
+        current_exposure = 0.0
+
+    remaining_room = max_notional - current_exposure
+    if remaining_room <= 0:
+        log.warning(
+            f"Exposure cap reached ({current_exposure:.2f} / {max_notional:.2f}) "
+            f"— skipping trade"
+        )
+        return None
+
+    if order_notional > remaining_room:
+        qty = remaining_room / entry_price
+        log.info(f"  Qty clamped to {qty:.6f} to stay within {MAX_CAPITAL_EXPOSURE*100:.0f}% exposure cap")
+
     log.info(
         f"{'🟢' if side == 'buy' else '🔴'} "
         f"{side.upper()} signal (strength {strength}) — "
-        f"{SYMBOL} qty {TRADE_AMOUNT}"
+        f"{SYMBOL} qty {qty:.6f}  (notional ${qty * entry_price:.2f})"
     )
     if sl_price:
         log.info(f"  Stop-loss : {sl_price:.2f}")
     if tp_price:
         log.info(f"  Take-profit: {tp_price:.2f}")
+    log.info(
+        f"  Risk: {MAX_RISK_PER_TRADE*100:.0f}% of ${capital:.2f} = "
+        f"${capital * MAX_RISK_PER_TRADE:.2f} max loss per trade"
+    )
 
     if not LIVE_TRADING:
         log.info("Paper-trade mode — order NOT sent to exchange")
         return None
 
     # --- Place primary market order ---
-    order = exchange.create_market_order(SYMBOL, side, TRADE_AMOUNT)
+    order = exchange.create_market_order(SYMBOL, side, qty)
     log.info(f"Order placed: {order['id']} — status: {order['status']}")
+
+    # For longs: SL/TP exit side is "sell".  For shorts: exit side is "buy".
+    exit_side = "sell" if side == "buy" else "buy"
 
     # --- Place stop-loss order ---
     if sl_price:
@@ -433,8 +636,8 @@ def execute_trade(
             sl_order = exchange.create_order(
                 symbol=SYMBOL,
                 type="stop_market",
-                side="sell",
-                amount=TRADE_AMOUNT,
+                side=exit_side,
+                amount=qty,
                 params={"stopPrice": sl_price},
             )
             log.info(f"SL order placed: {sl_order['id']} @ {sl_price:.2f}")
@@ -447,8 +650,8 @@ def execute_trade(
             tp_order = exchange.create_order(
                 symbol=SYMBOL,
                 type="take_profit_market",
-                side="sell",
-                amount=TRADE_AMOUNT,
+                side=exit_side,
+                amount=qty,
                 params={"stopPrice": tp_price},
             )
             log.info(f"TP order placed: {tp_order['id']} @ {tp_price:.2f}")
@@ -474,32 +677,48 @@ TIMEFRAME_SECONDS = {
 
 def run():
     exchange = create_exchange()
-    sleep_seconds = TIMEFRAME_SECONDS.get(TIMEFRAME, 3600)
+    # Sleep interval = shortest timeframe being scanned
+    sleep_seconds = min(TIMEFRAME_SECONDS.get(tf.strip(), 3600) for tf in TIMEFRAMES)
 
-    log.info(f"Bot started — {SYMBOL} on {EXCHANGE_ID} ({TIMEFRAME})")
+    log.info(f"Bot started — {SYMBOL} on {EXCHANGE_ID}")
+    log.info(f"Scanning timeframes: {', '.join(TIMEFRAMES)}")
     log.info(f"Min signals required: {MIN_SIGNALS} | Live trading: {LIVE_TRADING}")
+    log.info(f"Risk per trade: {MAX_RISK_PER_TRADE*100:.0f}% | Max exposure: {MAX_CAPITAL_EXPOSURE*100:.0f}%")
     log.info(f"S/R swing window: {SWING_WINDOW} | Touch tolerance: {SR_TOUCH_TOLERANCE*100:.1f}%")
     log.info("-" * 60)
 
     while True:
         try:
-            df = fetch_ohlcv(exchange)
-            df = add_indicators(df)
+            traded_this_cycle = False
 
-            last = df.iloc[-1]
-            log.info(
-                f"Candle {last['timestamp']}  close={last['close']:.2f}  "
-                f"RSI={last['rsi']:.1f}  MACD-H={last['macd_hist']:.4f}"
-            )
+            for tf in TIMEFRAMES:
+                tf = tf.strip()
+                log.info(f"[{tf}] Scanning {SYMBOL}...")
 
-            direction, strength, sr_setup = aggregate_signals(df)
+                df = fetch_ohlcv(exchange, tf)
+                df = add_indicators(df)
 
-            if direction != "neutral":
-                execute_trade(exchange, direction, strength, sr_setup)
-            else:
-                log.info("No trade signal — standing by")
+                last = df.iloc[-1]
+                log.info(
+                    f"[{tf}] Candle {last['timestamp']}  close={last['close']:.2f}  "
+                    f"RSI={last['rsi']:.1f}  MACD-H={last['macd_hist']:.4f}"
+                )
 
-            log.info(f"Sleeping {sleep_seconds}s until next candle...\n")
+                direction, strength, sr_setup = aggregate_signals(df)
+
+                if direction != "neutral" and not traded_this_cycle:
+                    log.info(f"[{tf}] Signal found — executing trade")
+                    execute_trade(exchange, direction, strength, sr_setup)
+                    traded_this_cycle = True  # one trade per cycle to respect exposure cap
+                elif direction != "neutral":
+                    log.info(f"[{tf}] Signal found but already traded this cycle — skipping")
+                else:
+                    log.info(f"[{tf}] No trade signal")
+
+            if not traded_this_cycle:
+                log.info("No signals across any timeframe — standing by")
+
+            log.info(f"Sleeping {sleep_seconds}s until next scan...\n")
             time.sleep(sleep_seconds)
 
         except ccxt.NetworkError as e:
